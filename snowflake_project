@@ -1,0 +1,506 @@
+--Create schema for raw data
+create schema ags_game_audience.RAW;
+
+
+---Create a Table
+create or replace TABLE AGS_GAME_AUDIENCE.RAW.GAME_LOGS (
+	RAW_LOG VARIANT
+);
+
+--🥋 Create an External Stage
+---stage name uni_kishore and url:s3://uni-kishore
+
+--listing all the files in stage
+LIST @uni_kishore;
+
+
+---Create a File Format to make the results of that query more readable. 
+create file format FF_JSON_LOGS
+    type = JSON
+    strip_outer_array = true;
+
+-- Exploring the File Before Loading It
+-- Check that both the stage and  file format are working correctly. 
+select $1
+from @uni_kishore/kickoff
+(file_format =>ff_json_logs);
+
+--🥋 Load the File Into The Table game_logs
+copy into ags_game_audience.raw.game_logs
+from @uni_kishore/kickoff
+file_format = (format_name=ff_json_logs);
+
+select * from ags_game_audience.raw.game_logs;
+
+--🥋 Building a Select Statement that Separates Every Attribute into It's Own Column
+SELECT 
+RAW_LOG:agent::text as AGENT
+,RAW_LOG:user_event as USER_EVENT
+,RAW_LOG:datetime_iso8601::TIMESTAMP_NTZ AS DATETIME_ISO8601
+,RAW_LOG:user_login as USER_LOGIN
+,*
+FROM game_logs;
+
+--📓 Wrapping Selects in Views 
+CREATE OR REPLACE VIEW LOGS AS 
+select 
+$1:agent as AGENT,
+$1:user_event AS USER_EVENT,
+$1:datetime_iso8601::TIMESTAMP_NTZ AS datetime_iso8601,
+$1:user_login AS USER_LOGIN
+,*
+from @uni_kishore/kickoff
+(file_format =>ff_json_logs);
+
+select * from  LOGS;
+
+
+--Listing files from @uni_kishore/updated_feed folder
+--the first file has agent but no ip_address
+--the second filr has ip_address but no agent
+select $1
+from @uni_kishore/updated_feed
+(file_format =>ff_json_logs);
+
+----🥋 Load the File Into The same Table game_logs
+copy into ags_game_audience.raw.game_logs
+from @uni_kishore/updated_feed
+file_format = (format_name=ff_json_logs);
+
+select * 
+from ags_game_audience.raw.game_logs;
+
+---Create or replace view with added ip address and filtered null values and removng agent col
+CREATE OR REPLACE VIEW LOGS AS 
+SELECT 
+RAW_LOG:datetime_iso8601::TIMESTAMP_NTZ AS datetime_iso8601,
+RAW_LOG:user_login::TEXT AS USER_LOGIN,
+RAW_LOG:ip_address::TEXT AS IP_ADDRESS,
+RAW_LOG:user_event::TEXT AS USER_EVENT,*
+from ags_game_audience.raw.game_logs
+WHERE RAW_LOG:ip_address::text is not null;
+
+select * 
+from ags_game_audience.raw.LOGS;
+
+--users date time field is added in UTC time zone 
+from  LOGS
+WHERE USER_LOGIN ilike '%prajina%';
+
+--Pull out the ipv4 property. This value is just the  internet connection IP Address formatted a different way. We need his IP Address in the ipv4 format because it is easier to compare to other numbers. 
+
+select parse_ip('100.41.16.160','inet'):ipv4; --Kishore's Headset's IP Address
+select parse_ip('100.41.16.160','inet'):host;
+select parse_ip('100.41.16.160','inet'):family;
+
+-- Create schema for enhanced data
+create schema ags_game_audience.ENHANCED;
+
+--Look up Kishore and Prajina's Time Zone in the IPInfo share using his headset's IP Address with the PARSE_IP function.
+select start_ip, end_ip, start_ip_int, end_ip_int, city, region, country, timezone
+from IPINFO_GEOLOC.demo.location
+where parse_ip('100.41.16.160', 'inet'):ipv4 --Kishore's Headset's IP Address
+BETWEEN start_ip_int AND end_ip_int;
+
+
+--Join the log and location tables to add time zone to each row using the PARSE_IP function.
+select logs.*
+       , loc.city
+       , loc.region
+       , loc.country
+       , loc.timezone
+from AGS_GAME_AUDIENCE.RAW.LOGS logs
+join IPINFO_GEOLOC.demo.location loc
+where parse_ip(logs.ip_address, 'inet'):ipv4 
+BETWEEN start_ip_int AND end_ip_int;
+
+
+
+--a Look Up table time_of_day_lu to convert from hour number to "time of day name"
+create table ags_game_audience.raw.time_of_day_lu
+(  hour number
+   ,tod_name varchar(25)
+);
+
+--insert statement to add all 24 rows to the table
+insert into time_of_day_lu
+values
+(6,'Early morning'),
+(7,'Early morning'),
+(8,'Early morning'),
+(9,'Mid-morning'),
+(10,'Mid-morning'),
+(11,'Late morning'),
+(12,'Late morning'),
+(13,'Early afternoon'),
+(14,'Early afternoon'),
+(15,'Mid-afternoon'),
+(16,'Mid-afternoon'),
+(17,'Late afternoon'),
+(18,'Late afternoon'),
+(19,'Early evening'),
+(20,'Early evening'),
+(21,'Late evening'),
+(22,'Late evening'),
+(23,'Late evening'),
+(0,'Late at night'),
+(1,'Late at night'),
+(2,'Late at night'),
+(3,'Toward morning'),
+(4,'Toward morning'),
+(5,'Toward morning');
+
+
+--Check the table to see if you loaded it properly
+select tod_name, listagg(hour,',') AS HRS 
+from time_of_day_lu
+group by tod_name;
+
+--Use two functions supplied by IPShare to help with an efficient IP Lookup Process!
+--The TO_JOIN_KEY function reduces the IP down to an integer that is helpful for joining with a range of rows that might match our IP Address.
+--The TO_INT function converts IP Addresses to integers so we don't have to try to compare them as strings! 
+
+
+--🥋 Convert the Select to a logs_enhanced Table 
+create or replace table ags_game_audience.enhanced.logs_enhanced as(
+SELECT logs.ip_address
+, logs.user_login AS GAMER_NAME
+, logs.user_event AS GAME_EVENT_NAME
+, logs.datetime_iso8601 AS GAME_EVENT_UTC
+, city
+, region
+, country
+, timezone as GAMER_LTZ_NAME
+, CONVERT_TIMEZONE('UTC',timezone,logs.datetime_iso8601) AS GAME_EVENT_LTZ
+, DAYNAME(GAME_EVENT_LTZ) AS DOW_NAME
+, tod_name
+from AGS_GAME_AUDIENCE.RAW.LOGS logs
+JOIN IPINFO_GEOLOC.demo.location loc 
+ON IPINFO_GEOLOC.public.TO_JOIN_KEY(logs.ip_address) = loc.join_key
+AND IPINFO_GEOLOC.public.TO_INT(logs.ip_address) 
+BETWEEN start_ip_int AND end_ip_int
+JOIN ags_game_audience.raw.time_of_day_lu LU
+ON LU.HOUR = HOUR(GAME_EVENT_LTZ)
+);
+
+SELECT * FROM ags_game_audience.enhanced.logs_enhanced;
+
+---We have now successfully taken data from a file (extracted it), enhanced it (transformed it) and put it into a database table (loaded it). 
+
+--- "production-izing" the data load. 
+
+
+--Now we'll write an INSERT MERGE that will add new records in the LOGS_ENHANCED table
+--AND WRAP IT INSIDE THE TASK to run every 5 min
+create or replace task AGS_GAME_AUDIENCE.RAW.LOAD_LOGS_ENHANCED
+    	warehouse=COMPUTE_WH
+    	schedule='5 minute'
+        as
+MERGE INTO ENHANCED.LOGS_ENHANCED e
+USING (
+        SELECT logs.ip_address 
+        , logs.user_login as GAMER_NAME
+        , logs.user_event as GAME_EVENT_NAME
+        , logs.datetime_iso8601 as GAME_EVENT_UTC
+        , city
+        , region
+        , country
+        , timezone as GAMER_LTZ_NAME
+        , CONVERT_TIMEZONE( 'UTC',timezone,logs.datetime_iso8601) as GAME_EVENT_LTZ
+        , DAYNAME(GAME_EVENT_LTZ) as DOW_NAME
+        , TOD_NAME
+        from ags_game_audience.raw.LOGS logs
+        JOIN ipinfo_geoloc.demo.location loc 
+        ON ipinfo_geoloc.public.TO_JOIN_KEY(logs.ip_address) = loc.join_key
+        AND ipinfo_geoloc.public.TO_INT(logs.ip_address) 
+        BETWEEN start_ip_int AND end_ip_int
+        JOIN ags_game_audience.raw.TIME_OF_DAY_LU tod
+        ON HOUR(GAME_EVENT_LTZ) = tod.hour
+        ) r
+ON r.gamer_name = e.GAMER_NAME
+and r.game_event_utc = e.game_event_utc
+and r.game_event_name = e.game_event_name
+WHEN NOT MATCHED THEN
+insert 
+        (IP_ADDRESS, GAMER_NAME, GAME_EVENT_NAME, 
+        GAME_EVENT_UTC, CITY, REGION, COUNTRY, 
+        GAMER_LTZ_NAME, GAME_EVENT_LTZ,
+        DOW_NAME, TOD_NAME) --list of columns
+values 
+        (IP_ADDRESS, GAMER_NAME, GAME_EVENT_NAME, 
+        GAME_EVENT_UTC, CITY, REGION, COUNTRY,
+        GAMER_LTZ_NAME, GAME_EVENT_LTZ,
+        DOW_NAME, TOD_NAME); --list of columns (but we can mark as coming from the r select)
+
+
+
+EXECUTE TASK AGS_GAME_AUDIENCE.RAW.LOAD_LOGS_ENHANCED;
+
+
+
+----🎯 Automating the data pipeling process
+--🥋 Create an External Stage
+---stage name UNI_KISHORE_PIPELINE and url:s3://uni-kishore-pipeline
+list  @UNI_KISHORE_PIPELINE;
+
+select $1
+from @UNI_KISHORE_PIPELINE
+(file_format =>ff_json_logs);
+
+--🎯 Create A New Raw Table!
+create or replace TABLE AGS_GAME_AUDIENCE.RAW.PL_GAME_LOGS (
+	RAW_LOG VARIANT
+);
+
+----🎯 Create a Task to Run the COPY INTO
+
+create or replace task AGS_GAME_AUDIENCE.RAW.GET_NEW_FILES
+--warehouse=COMPUTE_WH
+USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL'
+schedule='5 minutes'
+as 
+copy into AGS_GAME_AUDIENCE.RAW.PL_GAME_LOGS
+from @AGS_GAME_AUDIENCE.RAW.UNI_KISHORE_PIPELINE
+file_format=(format_name=ff_json_logs)
+FORCE=FALSE;--Adding FORCE=TRUE loads the same file, twice; 
+
+---CREATE VIEW PL_LOGS FROM TABLE PL_GAME_LOGS
+
+create or replace view AGS_GAME_AUDIENCE.RAW.PL_LOGS(
+	DATETIME_ISO8601,
+	USER_LOGIN,
+	IP_ADDRESS,
+	USER_EVENT,
+	RAW_LOG
+) as 
+SELECT 
+RAW_LOG:datetime_iso8601::TIMESTAMP_NTZ AS datetime_iso8601,
+RAW_LOG:user_login::TEXT AS USER_LOGIN,
+RAW_LOG:ip_address::TEXT AS IP_ADDRESS,
+RAW_LOG:user_event::TEXT AS USER_EVENT,
+RAW_LOG
+from ags_game_audience.raw.PL_GAME_LOGS;
+
+--📓 The Current State of Things
+
+--Our process is looking good. We have:
+
+--Step 1 TASK (invisible to you, but running every 5 minutes)(@UNI_KISHORE_PIPELINE) 5 MIN
+--Step 2 TASK that will load the new files into the raw table every 5 minutes (as soon as we turn it on). (GET_NEW_FILE)
+--Step 3 VIEW that is kind of boring but it does some light transformation (JSON-parsing) work for us.(PL_LOGS)  
+--Step 4 TASK  that will load the new rows into the enhanced table every 5 minutes (as soon as we turn it on).(LOAD_LOGS_ENHANCED)
+
+
+
+--🥋 Checking Tallies Along the Way
+TRUNCATE TABLE PL_GAME_LOGS;
+execute task AGS_GAME_AUDIENCE.RAW.GET_NEW_FILES;
+select * from AGS_GAME_AUDIENCE.RAW.PL_GAME_LOGS;
+
+/* "TASK DEPENDENCIES"
+What if we ran GET_NEW_FILES every 5 minutes and then ran LOAD_LOGS_ENHANCED based on Snowflake telling us that GET_NEW_FILES just finished? That would remove some of the uncertainty. 
+
+ "SERVERLESS". It means we don't have to spin up a warehouse, instead we can use a thread or two of another compute resource that is already running. Serverless compute is much more efficient for these very small tasks that don't do very much, but do what they do quite often.  */
+
+
+ --🥋 Grant Serverless Task Management to SYSADMIN
+
+use role accountadmin;
+grant EXECUTE MANAGED TASK on account to SYSADMIN;
+
+--switch back to sysadmin
+use role sysadmin;
+
+--🥋 Replace the WAREHOUSE Property in Your Tasks
+USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL';
+
+--🥋 Replace or Update the SCHEDULE Property
+--Change the SCHEDULE for GET_NEW_FILES so it runs more often
+schedule='5 Minutes'
+
+--Remove the SCHEDULE property and have LOAD_LOGS_ENHANCED run  
+--each time GET_NEW_FILES completes
+after AGS_GAME_AUDIENCE.RAW.GET_NEW_FILES
+
+--modified task 
+
+
+
+create or replace task AGS_GAME_AUDIENCE.RAW.LOAD_LOGS_ENHANCED
+	--warehouse=COMPUTE_WH
+	--schedule='5 minute'
+    USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL'
+    after AGS_GAME_AUDIENCE.RAW.GET_NEW_FILES
+	as 
+MERGE INTO ENHANCED.LOGS_ENHANCED e
+USING (
+        SELECT logs.ip_address 
+        , logs.user_login as GAMER_NAME
+        , logs.user_event as GAME_EVENT_NAME
+        , logs.datetime_iso8601 as GAME_EVENT_UTC
+        , city
+        , region
+        , country
+        , timezone as GAMER_LTZ_NAME
+        , CONVERT_TIMEZONE( 'UTC',timezone,logs.datetime_iso8601) as game_event_ltz
+        , DAYNAME(game_event_ltz) as DOW_NAME
+        , TOD_NAME
+        from ags_game_audience.raw.PL_LOGS logs
+        JOIN ipinfo_geoloc.demo.location loc 
+        ON ipinfo_geoloc.public.TO_JOIN_KEY(logs.ip_address) = loc.join_key
+        AND ipinfo_geoloc.public.TO_INT(logs.ip_address) 
+        BETWEEN start_ip_int AND end_ip_int
+        JOIN ags_game_audience.raw.TIME_OF_DAY_LU tod
+        ON HOUR(game_event_ltz) = tod.hour
+        ) r
+ON r.gamer_name = e.GAMER_NAME
+and r.game_event_utc = e.game_event_utc
+and r.game_event_name = e.game_event_name
+WHEN NOT MATCHED THEN
+insert 
+        (IP_ADDRESS, GAMER_NAME, GAME_EVENT_NAME, 
+        GAME_EVENT_UTC, CITY, REGION, COUNTRY, 
+        GAMER_LTZ_NAME, game_event_ltz,
+        DOW_NAME, TOD_NAME) --list of columns
+values 
+        (IP_ADDRESS, GAMER_NAME, GAME_EVENT_NAME, 
+        GAME_EVENT_UTC, CITY, REGION, COUNTRY,
+        GAMER_LTZ_NAME, game_event_ltz,
+        DOW_NAME, TOD_NAME);
+
+
+        
+/* few modifications to the pipeline
+- add some file metadata columns to the load so that he will have a record of what files he loaded and when. 
+- move the logic from the PL_LOGs view into the same SELECT. (fewer pieces to maintain).
+- he does change the select logic, he will then need a new target table to accommodate the output of the new select. 
+- When he has a new select that matches the new target table, he can put it into a new COPY INTO statement. 
+- After he has a new COPY INTO, he could put it into an Event-Driven Pipeline (instead of a task-based Time-Driven Pipeline)*/
+
+---🥋 A New Select with Metadata and Pre-Load JSON Parsing 
+create or replace table  ED_PIPELINE_LOGS as 
+  SELECT 
+    METADATA$FILENAME as log_file_name --new metadata column
+  , METADATA$FILE_ROW_NUMBER as log_file_row_id --new metadata column
+  , current_timestamp(0) as load_ltz --new local time of load
+  , get($1,'datetime_iso8601')::timestamp_ntz as DATETIME_ISO8601
+  , get($1,'user_event')::text as USER_EVENT
+  , get($1,'user_login')::text as USER_LOGIN
+  , get($1,'ip_address')::text as IP_ADDRESS    
+  FROM @AGS_GAME_AUDIENCE.RAW.UNI_KISHORE_PIPELINE
+  (file_format => 'ff_json_logs');
+
+
+--📓 Next Up: The Improved COPY INTO
+
+
+---🥋 Create the New COPY INTO 
+--truncate the table rows that were input during the CTAS, if that's what you did
+truncate table ED_PIPELINE_LOGS;
+
+--reload the table using your COPY INTO
+COPY INTO ED_PIPELINE_LOGS
+FROM (
+    SELECT 
+    METADATA$FILENAME as log_file_name 
+  , METADATA$FILE_ROW_NUMBER as log_file_row_id 
+  , current_timestamp(0) as load_ltz 
+  , get($1,'datetime_iso8601')::timestamp_ntz as DATETIME_ISO8601
+  , get($1,'user_event')::text as USER_EVENT
+  , get($1,'user_login')::text as USER_LOGIN
+  , get($1,'ip_address')::text as IP_ADDRESS    
+  FROM @AGS_GAME_AUDIENCE.RAW.UNI_KISHORE_PIPELINE
+)
+file_format = (format_name = ff_json_logs);
+
+select * from ED_PIPELINE_LOGS;
+
+
+
+--📓 Event-Driven Pipelines
+
+---The major alternative to Time-Driven Pipelines are Event-Driven Pipelines and they are made possible by a Snowflake object called a Snowpipe. 
+--Our Event-Driven Pipeline will "sleep" until a certain event takes place, then it will wake up and respond to the event. In our case, the "event" we care about is a new file being written to our bucket. When our pipe "hears" that a file has arrived, it will grab the file and move it into Snowflake. 
+
+--🥋 Create Your Snowpipe! with the  SNS Topic value
+
+CREATE OR REPLACE PIPE PIPE_GET_NEW_FILES
+auto_ingest=true
+aws_sns_topic='arn:aws:sns:us-west-2:321463406630:dngw_topic'
+AS 
+COPY INTO ED_PIPELINE_LOGS
+FROM (
+    SELECT 
+    METADATA$FILENAME as log_file_name 
+  , METADATA$FILE_ROW_NUMBER as log_file_row_id 
+  , current_timestamp(0) as load_ltz 
+  , get($1,'datetime_iso8601')::timestamp_ntz as DATETIME_ISO8601
+  , get($1,'user_event')::text as USER_EVENT
+  , get($1,'user_login')::text as USER_LOGIN
+  , get($1,'ip_address')::text as IP_ADDRESS    
+  FROM @AGS_GAME_AUDIENCE.RAW.UNI_KISHORE_PIPELINE
+)
+file_format = (format_name = ff_json_logs);
+
+
+
+truncate table AGS_GAME_AUDIENCE.ENHANCED.LOGS_ENHANCED;
+
+--Use this command if your Snowpipe seems like it is stalled out:
+
+ALTER PIPE ags_game_audience.raw.PIPE_GET_NEW_FILES REFRESH;
+
+--Use this command if you want to check that your pipe is running:
+
+select parse_json(SYSTEM$PIPE_STATUS( 'ags_game_audience.raw.PIPE_GET_NEW_FILES' ));
+
+
+
+--🎯 Update the LOAD_LOGS_ENHANCED Task so it loads from ED_PIPELINE_LOGS instead of PL_LOGS .
+--Now that there is no ROOT task, we can't use the ROOT task to trigger the LOAD_LOGS_ENHANCED. we need to set it back to being a task scheduled every 5 minutes. 
+
+create or replace task AGS_GAME_AUDIENCE.RAW.LOAD_LOGS_ENHANCED
+	--warehouse=COMPUTE_WH
+	schedule='5 minute'
+    USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL'
+    --after AGS_GAME_AUDIENCE.RAW.GET_NEW_FILES
+	as 
+MERGE INTO ENHANCED.LOGS_ENHANCED e
+USING (
+        SELECT logs.ip_address 
+        , logs.user_login as GAMER_NAME
+        , logs.user_event as GAME_EVENT_NAME
+        , logs.datetime_iso8601 as GAME_EVENT_UTC
+        , city
+        , region
+        , country
+        , timezone as GAMER_LTZ_NAME
+        , CONVERT_TIMEZONE( 'UTC',timezone,logs.datetime_iso8601) as game_event_ltz
+        , DAYNAME(game_event_ltz) as DOW_NAME
+        , TOD_NAME
+        from ags_game_audience.raw.ED_PIPELINE_LOGS logs
+        JOIN ipinfo_geoloc.demo.location loc 
+        ON ipinfo_geoloc.public.TO_JOIN_KEY(logs.ip_address) = loc.join_key
+        AND ipinfo_geoloc.public.TO_INT(logs.ip_address) 
+        BETWEEN start_ip_int AND end_ip_int
+        JOIN ags_game_audience.raw.TIME_OF_DAY_LU tod
+        ON HOUR(game_event_ltz) = tod.hour
+        ) r
+ON r.gamer_name = e.GAMER_NAME
+and r.game_event_utc = e.game_event_utc
+and r.game_event_name = e.game_event_name
+WHEN NOT MATCHED THEN
+insert 
+        (IP_ADDRESS, GAMER_NAME, GAME_EVENT_NAME, 
+        GAME_EVENT_UTC, CITY, REGION, COUNTRY, 
+        GAMER_LTZ_NAME, game_event_ltz,
+        DOW_NAME, TOD_NAME) --list of columns
+values 
+        (IP_ADDRESS, GAMER_NAME, GAME_EVENT_NAME, 
+        GAME_EVENT_UTC, CITY, REGION, COUNTRY,
+        GAMER_LTZ_NAME, game_event_ltz,
+        DOW_NAME, TOD_NAME);
+
+
+
+
